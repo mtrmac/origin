@@ -1,12 +1,14 @@
 package image
 
 import (
-	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
 
+	"github.com/containers/image/docker"
 	"github.com/containers/image/signature"
+	sigtypes "github.com/containers/image/types"
 	"github.com/openshift/origin/pkg/client"
 	"github.com/openshift/origin/pkg/cmd/templates"
 	"github.com/openshift/origin/pkg/cmd/util/clientcmd"
@@ -110,65 +112,27 @@ func (o *VerifyImageSignatureOptions) Complete(f *clientcmd.Factory, cmd *cobra.
 
 // verifySignature verifies the image signature and returns the identity when the signature
 // is valid.
-// TODO: This should be calling the 'containers/image' library in future.
-func (o *VerifyImageSignatureOptions) verifySignature(sigBlob []byte) (string, []byte, error) {
-	var (
-		mechanism signature.SigningMechanism
-		err       error
-	)
-	// If public key is specified, use JUST that key for verification. Otherwise use all
-	// keys in local GPG public keyring.
-	if len(o.PublicKeyFilename) == 0 {
-		mechanism, err = signature.NewGPGSigningMechanism()
-	} else {
-		mechanism, _, err = signature.NewEphemeralGPGSigningMechanism(o.PublicKey)
+func (o *VerifyImageSignatureOptions) verifySignature(pc *signature.PolicyContext, img *imageapi.Image, sigBlob []byte) (string, error) {
+	// Pretend that this is the only signature of img, and see what the policy says.
+	memoryImage, err := newUnparsedImage(o.ExpectedIdentity, img, sigBlob)
+	if err != nil {
+		return "", fmt.Errorf("error setting up signature verification: %v", err)
+	}
+	allowed, err := pc.IsRunningImageAllowed(memoryImage)
+	if !allowed && err == nil {
+		return "", errors.New("internal error: signature rejected but no error set")
 	}
 	if err != nil {
-		return "", nil, err
+		return "", fmt.Errorf("signsture rejected: %v", err)
 	}
-	defer mechanism.Close()
-	content, identity, err := mechanism.Verify(sigBlob)
+
+	// Because s.Content was the only signature used above, we now know that s.Content is acceptable, so untrustedInfo is good enough.
+	// And we really only want untrustedInfo.UntrustedShortKeyIdentifier, which does not depend on any context.
+	untrustedInfo, err := signature.GetUntrustedSignatureInformationWithoutVerifying(sigBlob)
 	if err != nil {
-		return "", nil, err
+		return "", fmt.Errorf("error getting signing key identity: %v", err) // Note that this is also treated as an unverified signature. It really shouldn’t happen anyway.
 	}
-	return string(identity), content, nil
-}
-
-// verifySignatureContent verifies that the signature content matches the given image.
-// TODO: This should be done by calling the 'containers/image' library in future.
-func (o *VerifyImageSignatureOptions) verifySignatureContent(content []byte) (string, error) {
-	// TODO: The types here are just to decompose the JSON. The fields should not change but
-	// we need to use containers/image library here to guarantee compatibility in future.
-	type criticalImage struct {
-		Digest string `json:"docker-manifest-digest"`
-	}
-	type criticalIdentity struct {
-		DockerReference string `json:"docker-reference"`
-	}
-	type critical struct {
-		Image    criticalImage    `json:"image"`
-		Identity criticalIdentity `json:"identity"`
-	}
-	type message struct {
-		Critical critical `json:"critical"`
-	}
-	m := message{}
-	if err := json.Unmarshal(content, &m); err != nil {
-		return "", err
-	}
-	if o.InputImage != m.Critical.Image.Digest {
-		return "", fmt.Errorf("signature is valid for digest %q not for %q", m.Critical.Image.Digest, o.InputImage)
-	}
-	return m.Critical.Identity.DockerReference, nil
-}
-
-// verifyImageIdentity verifies the source of the image specified in the signature is
-// valid.
-func (o *VerifyImageSignatureOptions) verifyImageIdentity(reference string) error {
-	if reference != o.ExpectedIdentity {
-		return fmt.Errorf("signature identity %q does not match expected image identity %q", reference, o.ExpectedIdentity)
-	}
-	return nil
+	return untrustedInfo.UntrustedShortKeyIdentifier, nil
 }
 
 // clearSignatureVerificationStatus removes the current image signature from the Image object by
@@ -177,6 +141,43 @@ func (o *VerifyImageSignatureOptions) verifyImageIdentity(reference string) erro
 func (o *VerifyImageSignatureOptions) clearSignatureVerificationStatus(s *imageapi.ImageSignature) {
 	s.Conditions = []imageapi.SignatureCondition{}
 	s.IssuedBy = nil
+}
+
+// unparsedImage implements sigtypes.UnparsedImage, to allow evaluating the signature policy
+// against an image without having to make it pullable by containers/image
+type unparsedImage struct {
+	ref       sigtypes.ImageReference
+	manifest  []byte
+	signature []byte
+}
+
+func newUnparsedImage(expectedIdentity string, img *imageapi.Image, signature []byte) (sigtypes.UnparsedImage, error) {
+	ref, err := docker.ParseReference("//" + expectedIdentity)
+	if err != nil {
+		return nil, fmt.Errorf("Invalid --expected-identity: %v", err)
+	}
+	return &unparsedImage{ref: ref, manifest: []byte(img.DockerImageManifest), signature: signature}, nil
+}
+
+// Reference returns the reference used to set up this source, _as specified by the user_
+// (not as the image itself, or its underlying storage, claims).  This can be used e.g. to determine which public keys are trusted for this image.
+func (ui *unparsedImage) Reference() sigtypes.ImageReference {
+	return ui.ref
+}
+
+// Close removes resources associated with an initialized UnparsedImage, if any.
+func (ui *unparsedImage) Close() error {
+	return nil
+}
+
+// Manifest is like ImageSource.GetManifest, but the result is cached; it is OK to call this however often you need.
+func (ui *unparsedImage) Manifest() ([]byte, string, error) {
+	return ui.manifest, "", nil
+}
+
+// Signatures is like ImageSource.GetSignatures, but the result is cached; it is OK to call this however often you need.
+func (ui *unparsedImage) Signatures() ([][]byte, error) {
+	return [][]byte{ui.signature}, nil
 }
 
 func (o *VerifyImageSignatureOptions) Run() error {
@@ -188,6 +189,16 @@ func (o *VerifyImageSignatureOptions) Run() error {
 		return fmt.Errorf("%s does not have any signature", img.Name)
 	}
 
+	policy, err := signature.DefaultPolicy(nil)
+	if err != nil {
+		return fmt.Errorf("Error reading signature verification policy: %v", err)
+	}
+	pc, err := signature.NewPolicyContext(policy)
+	if err != nil {
+		return fmt.Errorf("Error preparing for signature verification: %v", err)
+	}
+	defer pc.Destroy()
+
 	for i, s := range img.Signatures {
 		// If --remove is specified, just erase the existing signature verification for all
 		// signatures.
@@ -197,29 +208,14 @@ func (o *VerifyImageSignatureOptions) Run() error {
 			continue
 		}
 
-		// Verify the signature against the public key
-		signedBy, content, signatureErr := o.verifySignature(s.Content)
-		if signatureErr != nil {
-			fmt.Fprintf(o.ErrOut, "%s signature cannot be verified: %v\n", o.InputImage, signatureErr)
-		}
-
-		// Verify the signed message content matches with the provided image id
-		identity, signatureContentErr := o.verifySignatureContent(content)
-		if signatureContentErr != nil {
-			fmt.Fprintf(o.ErrOut, "%s signature content cannot be verified: %v\n", o.InputImage, signatureContentErr)
-		}
-
-		identityError := o.verifyImageIdentity(identity)
-		if identityError != nil {
-			fmt.Fprintf(o.ErrOut, "%s identity cannot be verified: %v\n", o.InputImage, identityError)
-		}
-
-		if signatureErr != nil || signatureContentErr != nil || identityError != nil {
+		// Verify the signature against the policy
+		signedBy, err := o.verifySignature(pc, img, s.Content)
+		if err != nil {
+			fmt.Fprintf(o.ErrOut, "error verifying %s signature %d: %v\n", o.InputImage, i, err)
 			o.clearSignatureVerificationStatus(&img.Signatures[i])
 			continue
 		}
-
-		fmt.Fprintf(o.Out, "%s signature is verified (signed by key: %q)\n", o.InputImage, signedBy)
+		fmt.Fprintf(o.Out, "%s signature %d is verified (signed by key: %q)\n", o.InputImage, i, signedBy)
 
 		now := unversioned.Now()
 		newConditions := []imageapi.SignatureCondition{
