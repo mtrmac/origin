@@ -6,6 +6,7 @@ import (
 	"io"
 	"io/ioutil"
 
+	"github.com/containers/image/signature"
 	"github.com/openshift/origin/pkg/client"
 	"github.com/openshift/origin/pkg/cmd/templates"
 	"github.com/openshift/origin/pkg/cmd/util/clientcmd"
@@ -110,23 +111,23 @@ func (o *VerifyImageSignatureOptions) Complete(f *clientcmd.Factory, cmd *cobra.
 // verifySignature verifies the image signature and returns the identity when the signature
 // is valid.
 // TODO: This should be calling the 'containers/image' library in future.
-func (o *VerifyImageSignatureOptions) verifySignature(signature []byte) (string, []byte, error) {
+func (o *VerifyImageSignatureOptions) verifySignature(sigBlob []byte) (string, []byte, error) {
 	var (
-		mechanism SigningMechanism
+		mechanism signature.SigningMechanism
 		err       error
 	)
 	// If public key is specified, use JUST that key for verification. Otherwise use all
 	// keys in local GPG public keyring.
 	if len(o.PublicKeyFilename) == 0 {
-		mechanism, err = newGPGSigningMechanismInDirectory("")
+		mechanism, err = signature.NewGPGSigningMechanism()
 	} else {
-		mechanism, _, err = newEphemeralGPGSigningMechanism(o.PublicKey)
+		mechanism, _, err = signature.NewEphemeralGPGSigningMechanism(o.PublicKey)
 	}
 	if err != nil {
 		return "", nil, err
 	}
 	defer mechanism.Close()
-	content, identity, err := mechanism.Verify(signature)
+	content, identity, err := mechanism.Verify(sigBlob)
 	if err != nil {
 		return "", nil, err
 	}
