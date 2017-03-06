@@ -175,6 +175,8 @@ os::build::internal::build_binaries() {
     version_ldflags=$(os::build::ldflags)
 
     # Use eval to preserve embedded quoted strings.
+    local common_gotags
+    common_gotags='containers_image_openpgp'
     local goflags
     eval "goflags=(${OS_GOFLAGS:-})"
 
@@ -222,7 +224,7 @@ os::build::internal::build_binaries() {
       if [[ ${#nonstatics[@]} -gt 0 ]]; then
         GOOS=${platform%/*} GOARCH=${platform##*/} go install \
           -pkgdir "${OS_OUTPUT_PKGDIR}/${platform}" \
-          -tags "${OS_GOFLAGS_TAGS-} ${!platform_gotags_envvar:-}" \
+          -tags "${common_gotags} ${OS_GOFLAGS_TAGS-} ${!platform_gotags_envvar:-}" \
           -ldflags "${version_ldflags}" \
           "${goflags[@]:+${goflags[@]}}" \
           "${nonstatics[@]}"
@@ -239,7 +241,7 @@ os::build::internal::build_binaries() {
         # disabling cgo allows use of delve
         CGO_ENABLED=0 GOOS=${platform%/*} GOARCH=${platform##*/} go test \
           -pkgdir "${OS_OUTPUT_PKGDIR}/${platform}" \
-          -tags "${OS_GOFLAGS_TAGS-} ${!platform_gotags_test_envvar:-}" \
+          -tags "${common_gotags} ${OS_GOFLAGS_TAGS-} ${!platform_gotags_test_envvar:-}" \
           -ldflags "${version_ldflags}" \
           -i -c -o "${outfile}" \
           "${goflags[@]:+${goflags[@]}}" \
