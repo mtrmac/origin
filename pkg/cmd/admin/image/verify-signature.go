@@ -5,10 +5,9 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"strings"
 
-	"github.com/containers/image/docker/policyconfiguration"
-	"github.com/containers/image/docker/reference"
+	"github.com/containers/image/docker"
+	"github.com/containers/image/image"
 	"github.com/containers/image/signature"
 	sigtypes "github.com/containers/image/types"
 	"github.com/openshift/origin/pkg/client"
@@ -51,6 +50,7 @@ type VerifyImageSignatureOptions struct {
 	Confirm           bool
 	Remove            bool
 	CurrentUser       string
+	DockerToken       string
 
 	Client client.Interface
 	Out    io.Writer
@@ -78,6 +78,15 @@ func NewCmdVerifyImageSignature(name, fullName string, f *clientcmd.Factory, out
 }
 
 func (o *VerifyImageSignatureOptions) Complete(f *clientcmd.Factory, cmd *cobra.Command, args []string, out io.Writer) error {
+	clientConfig, err := f.ClientConfig()
+	if err != nil {
+		return err
+	}
+	if clientConfig.BearerToken == "" {
+		return errors.New("you must use a client config with a token")
+	}
+	o.DockerToken = clientConfig.BearerToken
+
 	if len(args) != 1 {
 		return kcmdutil.UsageError(cmd, "exactly one image must be specified")
 	}
@@ -85,7 +94,6 @@ func (o *VerifyImageSignatureOptions) Complete(f *clientcmd.Factory, cmd *cobra.
 	if len(o.ExpectedIdentity) == 0 {
 		return kcmdutil.UsageError(cmd, "the --expected-identity must be specified")
 	}
-	var err error
 
 	// If --public-key is provided only this key will be used for verification and the
 	// .gnupg/pubring.gpg will be ignored.
@@ -116,7 +124,7 @@ func (o *VerifyImageSignatureOptions) Complete(f *clientcmd.Factory, cmd *cobra.
 // is valid.
 func (o *VerifyImageSignatureOptions) verifySignature(pc *signature.PolicyContext, img *imageapi.Image, sigBlob []byte) (string, error) {
 	// Pretend that this is the only signature of img, and see what the policy says.
-	memoryImage, err := newUnparsedImage(o.ExpectedIdentity, img, sigBlob)
+	memoryImage, err := o.newUnparsedImage(img, sigBlob)
 	if err != nil {
 		return "", fmt.Errorf("error setting up signature verification: %v", err)
 	}
@@ -145,155 +153,32 @@ func (o *VerifyImageSignatureOptions) clearSignatureVerificationStatus(s *imagea
 	s.IssuedBy = nil
 }
 
-// fakeDockerTransport is containers/image/docker.Transport, except that it only provides identity information.
-var fakeDockerTransport = dockerTransport{}
-
-type dockerTransport struct{}
-
-func (t dockerTransport) Name() string {
-	return "docker"
-}
-
-// ParseReference converts a string, which should not start with the ImageTransport.Name prefix, into an ImageReference.
-func (t dockerTransport) ParseReference(reference string) (sigtypes.ImageReference, error) {
-	return parseDockerReference(reference)
-}
-
-// ValidatePolicyConfigurationScope checks that scope is a valid name for a signature.PolicyTransportScopes keys
-// (i.e. a valid PolicyConfigurationIdentity() or PolicyConfigurationNamespaces() return value).
-// It is acceptable to allow an invalid value which will never be matched, it can "only" cause user confusion.
-// scope passed to this function will not be "", that value is always allowed.
-func (t dockerTransport) ValidatePolicyConfigurationScope(scope string) error {
-	// FIXME? We could be verifying the various character set and length restrictions
-	// from docker/distribution/reference.regexp.go, but other than that there
-	// are few semantically invalid strings.
-	return nil
-}
-
-// fakeDockerReference is containers/image/docker.Reference, except that only provides identity information.
-type fakeDockerReference struct{ ref reference.Named }
-
-// parseReference converts a string, which should not start with the ImageTransport.Name prefix, into an Docker ImageReference.
-func parseDockerReference(refString string) (sigtypes.ImageReference, error) {
-	if !strings.HasPrefix(refString, "//") {
-		return nil, fmt.Errorf("docker: image reference %s does not start with //", refString)
-	}
-	ref, err := reference.ParseNormalizedNamed(strings.TrimPrefix(refString, "//"))
-	if err != nil {
-		return nil, err
-	}
-	ref = reference.TagNameOnly(ref)
-
-	if reference.IsNameOnly(ref) {
-		return nil, fmt.Errorf("Docker reference %s has neither a tag nor a digest", reference.FamiliarString(ref))
-	}
-	// A github.com/distribution/reference value can have a tag and a digest at the same time!
-	// The docker/distribution API does not really support that (we can’t ask for an image with a specific
-	// tag and digest), so fail.  This MAY be accepted in the future.
-	// (Even if it were supported, the semantics of policy namespaces are unclear - should we drop
-	// the tag or the digest first?)
-	_, isTagged := ref.(reference.NamedTagged)
-	_, isDigested := ref.(reference.Canonical)
-	if isTagged && isDigested {
-		return nil, fmt.Errorf("Docker references with both a tag and digest are currently not supported")
-	}
-	return fakeDockerReference{
-		ref: ref,
-	}, nil
-}
-
-func (ref fakeDockerReference) Transport() sigtypes.ImageTransport {
-	return fakeDockerTransport
-}
-
-// StringWithinTransport returns a string representation of the reference, which MUST be such that
-// reference.Transport().ParseReference(reference.StringWithinTransport()) returns an equivalent reference.
-// NOTE: The returned string is not promised to be equal to the original input to ParseReference;
-// e.g. default attribute values omitted by the user may be filled in in the return value, or vice versa.
-// WARNING: Do not use the return value in the UI to describe an image, it does not contain the Transport().Name() prefix.
-func (ref fakeDockerReference) StringWithinTransport() string {
-	return "//" + reference.FamiliarString(ref.ref)
-}
-
-// DockerReference returns a Docker reference associated with this reference
-// (fully explicit, i.e. !reference.IsNameOnly, but reflecting user intent,
-// not e.g. after redirect or alias processing), or nil if unknown/not applicable.
-func (ref fakeDockerReference) DockerReference() reference.Named {
-	return ref.ref
-}
-
-// PolicyConfigurationIdentity returns a string representation of the reference, suitable for policy lookup.
-// This MUST reflect user intent, not e.g. after processing of third-party redirects or aliases;
-// The value SHOULD be fully explicit about its semantics, with no hidden defaults, AND canonical
-// (i.e. various references with exactly the same semantics should return the same configuration identity)
-// It is fine for the return value to be equal to StringWithinTransport(), and it is desirable but
-// not required/guaranteed that it will be a valid input to Transport().ParseReference().
-// Returns "" if configuration identities for these references are not supported.
-func (ref fakeDockerReference) PolicyConfigurationIdentity() string {
-	res, err := policyconfiguration.DockerReferenceIdentity(ref.ref)
-	if res == "" || err != nil { // Coverage: Should never happen, NewReference above should refuse values which could cause a failure.
-		panic(fmt.Sprintf("Internal inconsistency: policyconfiguration.DockerReferenceIdentity returned %#v, %v", res, err))
-	}
-	return res
-}
-
-// PolicyConfigurationNamespaces returns a list of other policy configuration namespaces to search
-// for if explicit configuration for PolicyConfigurationIdentity() is not set.  The list will be processed
-// in order, terminating on first match, and an implicit "" is always checked at the end.
-// It is STRONGLY recommended for the first element, if any, to be a prefix of PolicyConfigurationIdentity(),
-// and each following element to be a prefix of the element preceding it.
-func (ref fakeDockerReference) PolicyConfigurationNamespaces() []string {
-	return policyconfiguration.DockerReferenceNamespaces(ref.ref)
-}
-
-func (ref fakeDockerReference) NewImage(ctx *sigtypes.SystemContext) (sigtypes.Image, error) {
-	panic("Unimplemented")
-}
-func (ref fakeDockerReference) NewImageSource(ctx *sigtypes.SystemContext, requestedManifestMIMETypes []string) (sigtypes.ImageSource, error) {
-	panic("Unimplemented")
-}
-func (ref fakeDockerReference) NewImageDestination(ctx *sigtypes.SystemContext) (sigtypes.ImageDestination, error) {
-	panic("Unimplemented")
-}
-func (ref fakeDockerReference) DeleteImage(ctx *sigtypes.SystemContext) error {
-	panic("Unimplemented")
-}
-
-// unparsedImage implements sigtypes.UnparsedImage, to allow evaluating the signature policy
-// against an image without having to make it pullable by containers/image
+// unparsedImage wraps a sigtypes.UnparsedImage, overriding it so that
+// we are verifying only a single signature.
 type unparsedImage struct {
-	ref       sigtypes.ImageReference
-	manifest  []byte
+	sigtypes.UnparsedImage
 	signature []byte
-}
-
-func newUnparsedImage(expectedIdentity string, img *imageapi.Image, signature []byte) (sigtypes.UnparsedImage, error) {
-	ref, err := parseDockerReference("//" + expectedIdentity)
-	if err != nil {
-		return nil, fmt.Errorf("Invalid --expected-identity: %v", err)
-	}
-	return &unparsedImage{ref: ref, manifest: []byte(img.DockerImageManifest), signature: signature}, nil
-}
-
-// Reference returns the reference used to set up this source, _as specified by the user_
-// (not as the image itself, or its underlying storage, claims).  This can be used e.g. to determine which public keys are trusted for this image.
-func (ui *unparsedImage) Reference() sigtypes.ImageReference {
-	return ui.ref
-}
-
-// Close removes resources associated with an initialized UnparsedImage, if any.
-func (ui *unparsedImage) Close() error {
-	return nil
-}
-
-// Manifest is like ImageSource.GetManifest, but the result is cached; it is OK to call this however often you need.
-func (ui *unparsedImage) Manifest() ([]byte, string, error) {
-	return ui.manifest, "", nil
 }
 
 // Signatures is like ImageSource.GetSignatures, but the result is cached; it is OK to call this however often you need.
 func (ui *unparsedImage) Signatures() ([][]byte, error) {
 	return [][]byte{ui.signature}, nil
+}
+
+func (o *VerifyImageSignatureOptions) newUnparsedImage(img *imageapi.Image, signature []byte) (sigtypes.UnparsedImage, error) {
+	ref, err := docker.ParseReference("//" + img.DockerImageReference)
+	if err != nil {
+		return nil, fmt.Errorf("Invalid dockerImageReference %s for %s: %v", img.DockerImageReference, o.InputImage, err)
+	}
+	src, err := ref.NewImageSource(&sigtypes.SystemContext{
+		DockerAuthConfig: &sigtypes.DockerAuthConfig{
+			Username: "unused",
+			Password: o.DockerToken,
+		}}, nil)
+	if err != nil {
+		return nil, fmt.Errorf("Error initializing image %s: %v", o.InputImage, err)
+	}
+	return &unparsedImage{UnparsedImage: image.UnparsedFromSource(src), signature: signature}, nil
 }
 
 func (o *VerifyImageSignatureOptions) Run() error {
@@ -305,10 +190,15 @@ func (o *VerifyImageSignatureOptions) Run() error {
 		return fmt.Errorf("%s does not have any signature", img.Name)
 	}
 
-	policy, err := signature.DefaultPolicy(nil)
+	prm, err := signature.NewPRMExactReference(o.ExpectedIdentity)
 	if err != nil {
-		return fmt.Errorf("Error reading signature verification policy: %v", err)
+		return fmt.Errorf("Error setting up signature verification policy reference matcher: %v", err)
 	}
+	pr, err := signature.NewPRSignedByKeyPath(signature.SBKeyTypeGPGKeys, o.PublicKeyFilename, prm)
+	if err != nil {
+		return fmt.Errorf("Error setting up signature verification policy: %v", err)
+	}
+	policy := &signature.Policy{Default: []signature.PolicyRequirement{pr}}
 	pc, err := signature.NewPolicyContext(policy)
 	if err != nil {
 		return fmt.Errorf("Error preparing for signature verification: %v", err)
